@@ -1,0 +1,6 @@
+/datastore.json
+.env
+*.exe
+/dist
+/tools
+*.webm
