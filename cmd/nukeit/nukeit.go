@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
@@ -249,7 +250,6 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 			err := s.ChannelMessageDelete(channelID, msg.ID)
 			if err != nil {
 				if rateErr, ok := err.(*discordgo.RateLimitError); ok {
-					// Ха! Поймали лимит! Уважаем, ждём
 					fmt.Printf("Rate limit hit, sleeping for %.2f seconds\n", rateErr.RetryAfter.Seconds())
 					time.Sleep(rateErr.RetryAfter)
 					continue
@@ -259,7 +259,7 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 			}
 
 			deletedCount++
-			time.Sleep(200 * time.Millisecond) // Осторожничать всё ещё стоит
+			time.Sleep(300*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond)
 		}
 
 		lastMessageID = messages[len(messages)-1].ID
