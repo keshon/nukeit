@@ -93,6 +93,17 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (b *Bot) handleDeleteAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !b.isGuildOwner(i) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "You are not allowed to use this command.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
@@ -107,6 +118,17 @@ func (b *Bot) handleDeleteAll(s *discordgo.Session, i *discordgo.InteractionCrea
 }
 
 func (b *Bot) handleDeletePeriod(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !b.isGuildOwner(i) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "You are not allowed to use this command.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
 	options := i.ApplicationCommandData().Options
 	month := int(options[0].Value.(float64))
 	year := int(options[1].Value.(float64))
@@ -149,7 +171,6 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 		}
 
 		for _, msg := range messages {
-			// Skip messages outside the time range
 			if startTime != nil && msg.Timestamp.Before(*startTime) {
 				continue
 			}
@@ -157,14 +178,20 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 				continue
 			}
 
-			// Delete the message
 			err := s.ChannelMessageDelete(channelID, msg.ID)
 			if err != nil {
-				fmt.Printf("Error deleting message: %v", err)
+				if rateErr, ok := err.(*discordgo.RateLimitError); ok {
+					// Ха! Поймали лимит! Уважаем, ждём
+					fmt.Printf("Rate limit hit, sleeping for %.2f seconds\n", rateErr.RetryAfter.Seconds())
+					time.Sleep(rateErr.RetryAfter)
+					continue
+				}
+				fmt.Printf("Error deleting message: %v\n", err)
 				continue
 			}
+
 			deletedCount++
-			time.Sleep(200 * time.Millisecond) // Respect rate limits
+			time.Sleep(200 * time.Millisecond) // Осторожничать всё ещё стоит
 		}
 
 		lastID = messages[len(messages)-1].ID
@@ -188,6 +215,19 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 	} else {
 		fmt.Printf("Failed to DM user: %v", err)
 	}
+}
+
+func (b *Bot) isGuildOwner(i *discordgo.InteractionCreate) bool {
+	if i.GuildID == "" {
+		return false
+	}
+
+	guild, err := b.session.Guild(i.GuildID)
+	if err != nil {
+		return false
+	}
+
+	return guild.OwnerID == i.Member.User.ID
 }
 
 func loadEnv(path string) {
