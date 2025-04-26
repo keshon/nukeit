@@ -1,0 +1,11 @@
+services:
+  app:
+    image: '${ALIAS}-image'
+    container_name: ${ALIAS}
+    restart: always
+    volumes:
+      - ./.env:/usr/project/.env
+    environment:
+      - DISCORD_TOKEN
+
+    entrypoint: /usr/project/app
