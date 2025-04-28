@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,7 +14,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
-var guildID = "" // specify guild id for developing purpose (or command's names update will be fucked up)
+var (
+	guildID           string
+	requireOwnerCheck bool
+	activeDeletions   = make(map[string]chan struct{}) // channelID -> stop signal channel
+)
 
 type Bot struct {
 	session *discordgo.Session
@@ -31,7 +36,7 @@ func (b *Bot) Start() error {
 	b.configureIntents()
 	b.registerEventHandlers()
 
-	if err := b.openConnection(); err != nil {
+	if err := b.session.Open(); err != nil {
 		return fmt.Errorf("error opening connection: %w", err)
 	}
 
@@ -40,40 +45,21 @@ func (b *Bot) Start() error {
 
 func (b *Bot) Shutdown() {
 	if err := b.session.Close(); err != nil {
-		fmt.Printf("Error closing Discord session: %v", err)
+		fmt.Printf("Error closing Discord session: %v\n", err)
 	}
 }
 
-func (b *Bot) openConnection() error {
-	return b.session.Open()
-}
-
 func (b *Bot) configureIntents() {
-	b.session.Identify.Intents = discordgo.IntentsAll
+	b.session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 }
 
 func (b *Bot) registerEventHandlers() {
 	b.session.AddHandler(b.onReady)
-	b.session.AddHandler(b.onMessageCreate)
 	b.session.AddHandler(b.handleInteraction)
 }
 
 func (b *Bot) onReady(s *discordgo.Session, event *discordgo.Ready) {
-	fmt.Printf("Logged in as %s", s.State.User.String())
-
-	existingCommands, err := s.ApplicationCommands(s.State.User.ID, guildID)
-	if err != nil {
-		fmt.Printf("Error fetching commands: %v\n", err)
-	} else {
-		for _, cmd := range existingCommands {
-			err := s.ApplicationCommandDelete(s.State.User.ID, "", cmd.ID)
-			if err != nil {
-				fmt.Printf("Error deleting command %s: %v\n", cmd.Name, err)
-			} else {
-				fmt.Printf("Deleted command: %s\n", cmd.Name)
-			}
-		}
-	}
+	fmt.Printf("Logged in as %s\n", s.State.User.String())
 
 	commands := []*discordgo.ApplicationCommand{
 		{
@@ -90,27 +76,14 @@ func (b *Bot) onReady(s *discordgo.Session, event *discordgo.Ready) {
 		},
 		{
 			Name:        "nuke-to-date",
-			Description: "Delete messages from now till a specific period",
+			Description: "Delete messages from now until a specified date",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Name:        "month",
 					Description: "Select a month",
 					Type:        discordgo.ApplicationCommandOptionInteger,
 					Required:    true,
-					Choices: []*discordgo.ApplicationCommandOptionChoice{
-						{Name: "January", Value: 1},
-						{Name: "February", Value: 2},
-						{Name: "March", Value: 3},
-						{Name: "April", Value: 4},
-						{Name: "May", Value: 5},
-						{Name: "June", Value: 6},
-						{Name: "July", Value: 7},
-						{Name: "August", Value: 8},
-						{Name: "September", Value: 9},
-						{Name: "October", Value: 10},
-						{Name: "November", Value: 11},
-						{Name: "December", Value: 12},
-					},
+					Choices:     generateMonthChoices(),
 				},
 				{
 					Name:        "year",
@@ -127,6 +100,10 @@ func (b *Bot) onReady(s *discordgo.Session, event *discordgo.Ready) {
 				},
 			},
 		},
+		{
+			Name:        "stop",
+			Description: "Stop an ongoing deletion process",
+		},
 	}
 
 	for _, cmd := range commands {
@@ -139,10 +116,21 @@ func (b *Bot) onReady(s *discordgo.Session, event *discordgo.Ready) {
 	}
 }
 
+func generateMonthChoices() []*discordgo.ApplicationCommandOptionChoice {
+	months := []string{"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
+	choices := make([]*discordgo.ApplicationCommandOptionChoice, 0, len(months))
+	for i, name := range months {
+		choices = append(choices, &discordgo.ApplicationCommandOptionChoice{
+			Name:  name,
+			Value: i + 1,
+		})
+	}
+	return choices
+}
+
 func generateYearChoices() []*discordgo.ApplicationCommandOptionChoice {
 	currentYear := time.Now().Year()
 	choices := []*discordgo.ApplicationCommandOptionChoice{}
-
 	for year := currentYear - 5; year <= currentYear; year++ {
 		choices = append(choices, &discordgo.ApplicationCommandOptionChoice{
 			Name:  fmt.Sprintf("%d", year),
@@ -152,94 +140,143 @@ func generateYearChoices() []*discordgo.ApplicationCommandOptionChoice {
 	return choices
 }
 
-func (b *Bot) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m.Author.ID == s.State.User.ID {
-		return
-	}
-	// Print user guild id
-	// fmt.Println(m.GuildID)
-}
-
 func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	switch i.ApplicationCommandData().Name {
 	case "nuke":
-		b.handleDeleteAll(s, i)
+		b.handleNuke(s, i)
 	case "nuke-to-date":
-		b.handleDeletePeriod(s, i)
+		b.handleNukeToDate(s, i)
+	case "stop":
+		b.handleStop(s, i)
 	}
 }
 
-func (b *Bot) handleDeleteAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if !b.isGuildOwner(i) {
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "You are not allowed to use this command.",
-				Flags:   discordgo.MessageFlagsEphemeral,
-			},
-		})
+func (b *Bot) hasPermission(s *discordgo.Session, guildID, channelID, userID string) (bool, string) {
+	perms, err := s.UserChannelPermissions(userID, channelID)
+	if err != nil {
+		return false, "Failed to fetch permissions."
+	}
+
+	if requireOwnerCheck {
+		guild, err := s.Guild(guildID)
+		if err != nil {
+			return false, "Failed to fetch guild info."
+		}
+		if guild.OwnerID == userID {
+			return true, "User is the guild owner."
+		}
+		return false, "You must be the guild owner to execute this command."
+	}
+
+	if perms&discordgo.PermissionAdministrator != 0 {
+		return true, "User has administrator permissions."
+	}
+	return false, "Administrator permission required."
+}
+
+func (b *Bot) handleNuke(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	channelID := i.ChannelID
+	userID := i.Member.User.ID
+
+	ok, reason := b.hasPermission(s, i.GuildID, channelID, userID)
+	if !ok {
+		b.respondEphemeral(s, i, reason)
 		return
 	}
 
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: "Deleting your messages in this channel...",
-		},
-	})
-	b.deleteMessages(s, i.ChannelID, i.Member.User.ID, nil, nil)
+	if !b.checkBotPermissions(s, channelID) {
+		b.respondEphemeral(s, i, "I lack permissions to manage messages in this channel.")
+		return
+	}
+
+	confirmation := i.ApplicationCommandData().Options[0].StringValue()
+	if strings.ToLower(confirmation) != "yes" {
+		b.respondEphemeral(s, i, "You must type 'yes' to confirm the action.")
+		return
+	}
+
+	stopChan := make(chan struct{})
+	activeDeletions[channelID] = stopChan
+
+	b.respond(s, i, "Starting deletion...")
+
+	go b.deleteMessages(s, channelID, nil, nil, stopChan)
 }
 
-func (b *Bot) handleDeletePeriod(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if !b.isGuildOwner(i) {
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "You are not allowed to use this command.",
-				Flags:   discordgo.MessageFlagsEphemeral,
-			},
-		})
+func (b *Bot) handleNukeToDate(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	channelID := i.ChannelID
+	userID := i.Member.User.ID
+
+	ok, reason := b.hasPermission(s, i.GuildID, channelID, userID)
+	if !ok {
+		b.respondEphemeral(s, i, reason)
+		return
+	}
+
+	if !b.checkBotPermissions(s, channelID) {
+		b.respondEphemeral(s, i, "I lack permissions to manage messages in this channel.")
 		return
 	}
 
 	options := i.ApplicationCommandData().Options
-	month := int(options[0].Value.(float64))
-	year := int(options[1].Value.(float64))
-	confirmation := options[2].Value.(string)
+	month := int(options[0].IntValue())
+	year := int(options[1].IntValue())
+	confirmation := options[2].StringValue()
 
-	if confirmation != "yes" {
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "You must type 'yes' to confirm the action.",
-			},
-		})
+	if strings.ToLower(confirmation) != "yes" {
+		b.respondEphemeral(s, i, "You must type 'yes' to confirm the action.")
 		return
 	}
 
 	startTime := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	endTime := time.Now().UTC() //endTime := startTime.AddDate(0, 1, 0).Add(-time.Second)
+	endTime := time.Now().UTC()
 
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("Deleting messages from %s to %s...", startTime.Format("January 2006"), endTime.Format("January 2006")),
-		},
-	})
-	b.deleteMessages(s, i.ChannelID, i.Member.User.ID, &startTime, &endTime)
+	stopChan := make(chan struct{})
+	activeDeletions[channelID] = stopChan
+
+	b.respond(s, i, fmt.Sprintf("Starting deletion from %s to %s...", startTime.Format(time.RFC822), endTime.Format(time.RFC822)))
+
+	go b.deleteMessages(s, channelID, &startTime, &endTime, stopChan)
 }
 
-func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID string, startTime, endTime *time.Time) {
+func (b *Bot) handleStop(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	channelID := i.ChannelID
+
+	if stopChan, ok := activeDeletions[channelID]; ok {
+		close(stopChan)
+		delete(activeDeletions, channelID)
+		b.respond(s, i, "Deletion process stopped.")
+	} else {
+		b.respondEphemeral(s, i, "No active deletion process in this channel.")
+	}
+}
+
+func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, startTime, endTime *time.Time, stopChan <-chan struct{}) {
 	var lastMessageID string
 	deletedCount := 0
 
+deletionLoop:
 	for {
+		select {
+		case <-stopChan:
+			fmt.Printf("Stopped deletion in channel %s\n", channelID)
+			break deletionLoop
+		default:
+		}
+
 		messages, err := s.ChannelMessages(channelID, 100, lastMessageID, "", "")
 		if err != nil || len(messages) == 0 {
 			break
 		}
 
 		for _, msg := range messages {
+			select {
+			case <-stopChan:
+				fmt.Printf("Stopped deletion in channel %s\n", channelID)
+				break deletionLoop
+			default:
+			}
+
 			if startTime != nil && msg.Timestamp.Before(*startTime) {
 				continue
 			}
@@ -268,32 +305,35 @@ func (b *Bot) deleteMessages(s *discordgo.Session, channelID string, userID stri
 		}
 	}
 
-	report := fmt.Sprintf("Deleted %d messages in channel <#%s>", deletedCount, channelID)
-	if startTime != nil && endTime != nil {
-		report += fmt.Sprintf(" from %s to %s.", startTime.Format(time.RFC822), endTime.Format(time.RFC822))
-	} else {
-		report += "."
-	}
-
-	dmChannel, err := s.UserChannelCreate(userID)
-	if err == nil {
-		s.ChannelMessageSend(dmChannel.ID, report)
-	} else {
-		fmt.Printf("Failed to DM user: %v", err)
-	}
+	fmt.Printf("Deleted %d messages in channel %s\n", deletedCount, channelID)
 }
 
-func (b *Bot) isGuildOwner(i *discordgo.InteractionCreate) bool {
-	if i.GuildID == "" {
-		return false
-	}
-
-	guild, err := b.session.Guild(i.GuildID)
+func (b *Bot) checkBotPermissions(s *discordgo.Session, channelID string) bool {
+	botID := s.State.User.ID
+	perms, err := s.UserChannelPermissions(botID, channelID)
 	if err != nil {
 		return false
 	}
+	return perms&discordgo.PermissionManageMessages != 0
+}
 
-	return guild.OwnerID == i.Member.User.ID
+func (b *Bot) respond(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+		},
+	})
+}
+
+func (b *Bot) respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
 }
 
 func loadEnv(path string) {
@@ -301,24 +341,21 @@ func loadEnv(path string) {
 		fmt.Println("Error loading .env file")
 	}
 
-	if os.Getenv("DISCORD_TOKEN") == "" {
+	token := os.Getenv("DISCORD_TOKEN")
+	if token == "" {
 		log.Fatal("DISCORD_TOKEN is missing in environment variables")
 	}
 
-	if os.Getenv("TEST_GUILD_ID") == "" {
-		fmt.Println("TEST_GUILD_ID is missing in environment variables. It is not mandatory and is used for development purpose")
-	}
-
 	guildID = os.Getenv("TEST_GUILD_ID")
+
+	checkMode := strings.ToLower(os.Getenv("CHECK_MODE"))
+	requireOwnerCheck = (checkMode == "owner")
 }
 
 func main() {
 	loadEnv("./.env")
 
 	token := os.Getenv("DISCORD_TOKEN")
-	if token == "" {
-		log.Fatal("Discord token not found in environment variables")
-	}
 
 	bot, err := NewBot(token)
 	if err != nil {
@@ -334,5 +371,6 @@ func main() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
-	close(sc)
+
+	fmt.Println("Shutting down...")
 }

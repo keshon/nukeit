@@ -7,5 +7,6 @@ services:
       - ./.env:/usr/project/.env
     environment:
       - DISCORD_TOKEN
+      - CHECK_MODE
 
     entrypoint: /usr/project/app
